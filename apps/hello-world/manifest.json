@@ -1,0 +1,26 @@
+{
+  "id": "hello-world",
+  "name": "Hello World Reference App",
+  "version": "1.0.0",
+  "description": "Reference design mini-app demonstrating EventBridge activity subscriptions, SQS buffering, and shared data layer access.",
+  "category": "Reference & Templates",
+  "author": "Strava Hub Community",
+  "icon": "sparkles",
+  "image": "assets/preview.png",
+  "capabilities": [
+    "activity.created",
+    "activity.updated"
+  ],
+  "eventSubscriptions": [
+    {
+      "source": "strava.hub.activity",
+      "detailType": "ActivityCreated"
+    },
+    {
+      "source": "strava.hub.activity",
+      "detailType": "ActivityUpdated"
+    }
+  ],
+  "docsPath": "README.md",
+  "status": "active"
+}
