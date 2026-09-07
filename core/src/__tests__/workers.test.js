@@ -1,0 +1,158 @@
+const athleteRepository = require('../repositories/athlete-repository');
+const activityRepository = require('../repositories/activity-repository');
+const stravaService = require('../services/strava');
+const eventbridgeService = require('../services/eventbridge');
+const queueService = require('../services/queue');
+const syncWorker = require('../workers/sync-worker');
+const fetchWorker = require('../workers/fetch-worker');
+
+describe('Workers', () => {
+  beforeEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  describe('SyncWorker', () => {
+    test('processes create record: fetches detailed activity, saves, and emits event', async () => {
+      jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
+        athleteId: '12345',
+        accessToken: 'valid-token',
+        refreshToken: 'refresh-token',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600, // 1 hour remaining
+      });
+
+      jest.spyOn(stravaService, 'getActivity').mockResolvedValueOnce({
+        id: 999,
+        name: 'Morning Run',
+        type: 'Run',
+        distance: 5000,
+      });
+
+      jest.spyOn(activityRepository, 'saveActivity').mockResolvedValueOnce({
+        athleteId: '12345',
+        activityId: '999',
+        name: 'Morning Run',
+      });
+
+      jest.spyOn(athleteRepository, 'updateSyncStatus').mockResolvedValueOnce({});
+      const publishSpy = jest.spyOn(eventbridgeService, 'publishActivityEvent').mockResolvedValueOnce('evt-1');
+
+      const event = {
+        Records: [
+          {
+            body: JSON.stringify({
+              athleteId: '12345',
+              activityId: '999',
+              aspectType: 'create',
+            }),
+          },
+        ],
+      };
+
+      await syncWorker.handler(event);
+
+      expect(athleteRepository.getAthlete).toHaveBeenCalledWith('12345', { decryptTokens: true });
+      expect(stravaService.getActivity).toHaveBeenCalledWith('valid-token', '999');
+      expect(activityRepository.saveActivity).toHaveBeenCalled();
+      expect(publishSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          athleteId: '12345',
+          activityId: '999',
+          aspectType: 'create',
+        })
+      );
+    });
+
+    test('processes delete record: removes from DDB and S3 and emits delete event', async () => {
+      jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
+        athleteId: '12345',
+      });
+      const deleteSpy = jest.spyOn(activityRepository, 'deleteActivity').mockResolvedValueOnce(true);
+      const publishSpy = jest.spyOn(eventbridgeService, 'publishActivityEvent').mockResolvedValueOnce('evt-del');
+
+      const event = {
+        Records: [
+          {
+            body: JSON.stringify({
+              athleteId: '12345',
+              activityId: '999',
+              aspectType: 'delete',
+            }),
+          },
+        ],
+      };
+
+      await syncWorker.handler(event);
+
+      expect(deleteSpy).toHaveBeenCalledWith('12345', '999');
+      expect(publishSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          aspectType: 'delete',
+        })
+      );
+    });
+
+    test('re-throws RateLimitError to trigger SQS retry backoff', async () => {
+      jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
+        athleteId: '12345',
+        accessToken: 'token',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      });
+
+      jest.spyOn(stravaService, 'getActivity').mockRejectedValueOnce(new stravaService.RateLimitError('Rate limit'));
+
+      const event = {
+        Records: [
+          {
+            body: JSON.stringify({
+              athleteId: '12345',
+              activityId: '999',
+              aspectType: 'create',
+            }),
+          },
+        ],
+      };
+
+      await expect(syncWorker.handler(event)).rejects.toThrow('Rate limit');
+    });
+  });
+
+  describe('FetchWorker', () => {
+    test('pages historical activities and enqueues sync batch', async () => {
+      jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
+        athleteId: '12345',
+        accessToken: 'token',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      });
+
+      // Page 1 returns 2 activities (< 50, so terminates)
+      jest.spyOn(stravaService, 'listActivities').mockResolvedValueOnce([
+        { id: 101 },
+        { id: 102 },
+      ]);
+
+      const enqueueBatchSpy = jest.spyOn(queueService, 'enqueueActivitySyncBatch').mockResolvedValueOnce(['msg-1', 'msg-2']);
+
+      const event = {
+        Records: [
+          {
+            body: JSON.stringify({
+              athleteId: '12345',
+              days: 60,
+            }),
+          },
+        ],
+      };
+
+      await fetchWorker.handler(event);
+
+      expect(stravaService.listActivities).toHaveBeenCalledTimes(1);
+      expect(enqueueBatchSpy).toHaveBeenCalledWith(
+        '12345',
+        [
+          { activityId: '101', aspectType: 'create' },
+          { activityId: '102', aspectType: 'create' },
+        ]
+      );
+    });
+  });
+});
