@@ -123,8 +123,9 @@ async function enqueueActivitySyncBatch(athleteId, items) {
  * Enqueue an activity historical backfill request.
  * @param {string} athleteId
  * @param {number} [days=60]
+ * @param {string} [jobId]
  */
-async function enqueueActivityFetch(athleteId, days = 60) {
+async function enqueueActivityFetch(athleteId, days = 60, jobId = null) {
   const queueUrl = getFetchQueueUrl();
   if (!queueUrl) {
     throw new Error('FETCH_QUEUE_URL environment variable is not set');
@@ -136,6 +137,10 @@ async function enqueueActivityFetch(athleteId, days = 60) {
     requestedAt: new Date().toISOString(),
   };
 
+  if (jobId) {
+    payload.jobId = String(jobId);
+  }
+
   try {
     const command = new SendMessageCommand({
       QueueUrl: queueUrl,
@@ -144,13 +149,13 @@ async function enqueueActivityFetch(athleteId, days = 60) {
 
     const response = await sqsClient.send(command);
     logger.info(
-      { athleteId, days, messageId: response.MessageId },
+      { athleteId, days, jobId, messageId: response.MessageId },
       'Enqueued historical activity fetch request'
     );
     return response.MessageId;
   } catch (error) {
     logger.error(
-      { athleteId, days, queueUrl, errMessage: error.message },
+      { athleteId, days, jobId, queueUrl, errMessage: error.message },
       'Failed to enqueue activity fetch request'
     );
     throw error;

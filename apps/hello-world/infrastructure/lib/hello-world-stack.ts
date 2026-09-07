@@ -85,6 +85,9 @@ export class HelloWorldStack extends cdk.Stack {
       eventPattern: {
         source: ['strava.hub.activity'],
         detailType: ['ActivityCreated', 'ActivityUpdated'],
+        detail: {
+          isBackfill: [{ exists: false }],
+        },
       },
     });
 

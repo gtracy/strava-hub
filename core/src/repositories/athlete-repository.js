@@ -7,11 +7,16 @@ const {
   UpdateCommand,
 } = require('@aws-sdk/lib-dynamodb');
 const kmsService = require('../services/kms');
+const stravaService = require('../services/strava');
 const logger = require('../logger');
 
 const region = process.env.AWS_REGION || 'us-east-2';
 const ddbClient = new DynamoDBClient({ region });
 const docClient = DynamoDBDocumentClient.from(ddbClient);
+
+function isValidAthleteId(id) {
+  return typeof id === 'string' && /^\d+$/.test(id);
+}
 
 function getTableName() {
   return process.env.ATHLETES_TABLE_NAME || `strava-hub-${process.env.STAGE || 'dev'}-athletes`;
@@ -45,7 +50,10 @@ async function saveAthlete({
   measurementPreference,
 }) {
   const tableName = getTableName();
-  const idStr = String(athleteId);
+  const idStr = String(athleteId || '');
+  if (!isValidAthleteId(idStr)) {
+    throw new Error('Invalid athlete ID');
+  }
   const now = new Date().toISOString();
 
   let encryptedAccessToken = null;
@@ -92,10 +100,15 @@ async function saveAthlete({
       item.createdAt = now;
       item.totalActivities = 0;
       item.lastSyncAt = null;
+      item.tier = 'free';
     } else {
       item.createdAt = existing.createdAt || now;
       item.totalActivities = existing.totalActivities || 0;
       item.lastSyncAt = existing.lastSyncAt || null;
+      item.tier = existing.tier || 'free';
+      if (existing.syncJob) {
+        item.syncJob = existing.syncJob;
+      }
       if (!encryptedAccessToken && existing.encryptedAccessToken) {
         item.encryptedAccessToken = existing.encryptedAccessToken;
       }
@@ -245,11 +258,156 @@ async function deleteAthlete(athleteId) {
   }
 }
 
+/**
+ * Ensure an active, valid Strava access token for the athlete, refreshing if expired.
+ * Centralized DRY implementation.
+ * @param {Object|string} athleteOrId
+ * @returns {Promise<string>} Valid access token
+ */
+async function getValidAccessToken(athleteOrId) {
+  let athlete = athleteOrId;
+  if (typeof athleteOrId === 'string') {
+    athlete = await getAthlete(athleteOrId, { decryptTokens: true });
+  } else if (!athlete.accessToken && athlete.encryptedAccessToken) {
+    athlete = await getAthlete(athlete.athleteId, { decryptTokens: true });
+  }
+
+  if (!athlete) {
+    throw new Error('Athlete not found');
+  }
+
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  const bufferSeconds = 300; // 5 minute buffer
+
+  if (athlete.accessToken && athlete.expiresAt && athlete.expiresAt > nowEpoch + bufferSeconds) {
+    return athlete.accessToken;
+  }
+
+  logger.info(
+    { athleteId: athlete.athleteId },
+    'Strava token expired or expiring soon; refreshing token'
+  );
+
+  const refreshed = await stravaService.refreshToken(athlete.refreshToken);
+  await saveAthlete({
+    athleteId: athlete.athleteId,
+    accessToken: refreshed.access_token,
+    refreshToken: refreshed.refresh_token,
+    expiresAt: refreshed.expires_at,
+  });
+
+  return refreshed.access_token;
+}
+
+/**
+ * Acquire an atomic lock for a historical backfill job.
+ * Fails with ConditionalCheckFailedException if a job is already 'syncing' within 5 minutes.
+ * @param {string} athleteId
+ * @param {string} jobId - Unique UUID
+ * @param {number} days - Number of days to backfill
+ */
+async function acquireSyncLock(athleteId, jobId, days) {
+  const tableName = getTableName();
+  const idStr = String(athleteId);
+  if (!isValidAthleteId(idStr)) {
+    throw new Error('Invalid athlete ID');
+  }
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const fiveMinutesAgoIso = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+
+  const syncJob = {
+    jobId,
+    status: 'syncing',
+    startedAt: nowIso,
+    days,
+    count: 0,
+  };
+
+  const command = new UpdateCommand({
+    TableName: tableName,
+    Key: { athleteId: idStr },
+    UpdateExpression: 'SET syncJob = :newJob, updatedAt = :now',
+    ConditionExpression:
+      'attribute_exists(athleteId) AND (attribute_not_exists(syncJob) OR syncJob.#status <> :syncing OR syncJob.startedAt < :fiveMinutesAgo)',
+    ExpressionAttributeNames: {
+      '#status': 'status',
+    },
+    ExpressionAttributeValues: {
+      ':newJob': syncJob,
+      ':now': nowIso,
+      ':syncing': 'syncing',
+      ':fiveMinutesAgo': fiveMinutesAgoIso,
+    },
+    ReturnValues: 'ALL_NEW',
+  });
+
+  const response = await docClient.send(command);
+  logger.info({ athleteId: idStr, jobId, days }, 'Acquired historical sync lock');
+  return response.Attributes?.syncJob;
+}
+
+/**
+ * Transition a sync job to completed or failed.
+ * @param {string} athleteId
+ * @param {string} jobId
+ * @param {'completed'|'failed'} status
+ * @param {number} [count=0]
+ */
+async function completeSyncJob(athleteId, jobId, status, count = 0) {
+  const tableName = getTableName();
+  const idStr = String(athleteId);
+  const nowIso = new Date().toISOString();
+
+  let updateExpression =
+    'SET syncJob.#status = :status, syncJob.completedAt = :now, syncJob.#count = :count, updatedAt = :now';
+  const expressionAttributeValues = {
+    ':status': status,
+    ':now': nowIso,
+    ':count': count,
+    ':jobId': jobId,
+  };
+
+  if (status === 'completed') {
+    updateExpression += ', lastSyncAt = :now';
+  }
+
+  try {
+    const command = new UpdateCommand({
+      TableName: tableName,
+      Key: { athleteId: idStr },
+      UpdateExpression: updateExpression,
+      ConditionExpression: 'attribute_exists(athleteId) AND syncJob.jobId = :jobId',
+      ExpressionAttributeNames: {
+        '#status': 'status',
+        '#count': 'count',
+      },
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW',
+    });
+
+    const response = await docClient.send(command);
+    logger.info({ athleteId: idStr, jobId, status, count }, 'Updated historical sync job state');
+    return response.Attributes?.syncJob;
+  } catch (error) {
+    logger.error(
+      { athleteId: idStr, jobId, status, errMessage: error.message },
+      'Failed to update historical sync job state (may be superseded by newer job)'
+    );
+    return null;
+  }
+}
+
 module.exports = {
   saveAthlete,
   getAthlete,
+  getValidAccessToken,
+  acquireSyncLock,
+  completeSyncJob,
   updateSyncStatus,
   deleteAthlete,
+  isValidAthleteId,
   docClient,
   ddbClient,
 };

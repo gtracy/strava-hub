@@ -5,32 +5,8 @@ const stravaService = require('../services/strava');
 const eventbridgeService = require('../services/eventbridge');
 const { RateLimitError, TokenRevokedError } = require('../services/strava');
 
-/**
- * Ensure an active, valid Strava access token for the athlete, refreshing if expired.
- */
-async function getValidAccessToken(athlete) {
-  const nowEpoch = Math.floor(Date.now() / 1000);
-  const bufferSeconds = 300; // 5 minutes buffer
-
-  if (athlete.accessToken && athlete.expiresAt && athlete.expiresAt > nowEpoch + bufferSeconds) {
-    return athlete.accessToken;
-  }
-
-  logger.info(
-    { athleteId: athlete.athleteId },
-    'Strava token expired or expiring soon, refreshing token'
-  );
-
-  const refreshed = await stravaService.refreshToken(athlete.refreshToken);
-  await athleteRepository.saveAthlete({
-    athleteId: athlete.athleteId,
-    accessToken: refreshed.access_token,
-    refreshToken: refreshed.refresh_token,
-    expiresAt: refreshed.expires_at,
-  });
-
-  return refreshed.access_token;
-}
+// Use centralized getValidAccessToken from athleteRepository
+const getValidAccessToken = athleteRepository.getValidAccessToken;
 
 /**
  * Lambda handler for SQS ActivitySyncQueue records.

@@ -117,20 +117,28 @@ describe('Workers', () => {
   });
 
   describe('FetchWorker', () => {
-    test('pages historical activities and enqueues sync batch', async () => {
+    test('pages historical activities, saves summaries directly, emits backfill events, and completes sync job', async () => {
       jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
         athleteId: '12345',
         accessToken: 'token',
         expiresAt: Math.floor(Date.now() / 1000) + 3600,
       });
 
-      // Page 1 returns 2 activities (< 50, so terminates)
+      // Page 1 returns 2 activities (< 200 perPage, so terminates)
       jest.spyOn(stravaService, 'listActivities').mockResolvedValueOnce([
-        { id: 101 },
-        { id: 102 },
+        { id: 101, name: 'Morning Run', distance: 5000, type: 'Run' },
+        { id: 102, name: 'Evening Ride', distance: 20000, type: 'Ride' },
       ]);
 
-      const enqueueBatchSpy = jest.spyOn(queueService, 'enqueueActivitySyncBatch').mockResolvedValueOnce(['msg-1', 'msg-2']);
+      const saveSummarySpy = jest.spyOn(activityRepository, 'saveSummaryActivity').mockImplementation(async (athId, act) => ({
+        athleteId: athId,
+        activityId: String(act.id),
+        name: act.name,
+      }));
+
+      const publishSpy = jest.spyOn(eventbridgeService, 'publishActivityEvent').mockResolvedValue('evt-backfill');
+      const updateSyncSpy = jest.spyOn(athleteRepository, 'updateSyncStatus').mockResolvedValueOnce({});
+      const completeSyncJobSpy = jest.spyOn(athleteRepository, 'completeSyncJob').mockResolvedValueOnce({});
 
       const event = {
         Records: [
@@ -138,6 +146,7 @@ describe('Workers', () => {
             body: JSON.stringify({
               athleteId: '12345',
               days: 60,
+              jobId: 'job-abc-123',
             }),
           },
         ],
@@ -146,13 +155,45 @@ describe('Workers', () => {
       await fetchWorker.handler(event);
 
       expect(stravaService.listActivities).toHaveBeenCalledTimes(1);
-      expect(enqueueBatchSpy).toHaveBeenCalledWith(
-        '12345',
-        [
-          { activityId: '101', aspectType: 'create' },
-          { activityId: '102', aspectType: 'create' },
-        ]
+      expect(saveSummarySpy).toHaveBeenCalledTimes(2);
+      expect(publishSpy).toHaveBeenCalledTimes(2);
+      expect(publishSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          athleteId: '12345',
+          activityId: '101',
+          isBackfill: true,
+        })
       );
+      expect(updateSyncSpy).toHaveBeenCalledWith('12345', expect.any(String), 2);
+      expect(completeSyncJobSpy).toHaveBeenCalledWith('12345', 'job-abc-123', 'completed', 2);
+    });
+
+    test('marks sync job failed and re-throws RateLimitError on 429', async () => {
+      jest.spyOn(athleteRepository, 'getAthlete').mockResolvedValueOnce({
+        athleteId: '12345',
+        accessToken: 'token',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      });
+
+      jest.spyOn(stravaService, 'listActivities').mockRejectedValueOnce(
+        new stravaService.RateLimitError('Rate limit exceeded')
+      );
+      const completeSyncJobSpy = jest.spyOn(athleteRepository, 'completeSyncJob').mockResolvedValueOnce({});
+
+      const event = {
+        Records: [
+          {
+            body: JSON.stringify({
+              athleteId: '12345',
+              days: 30,
+              jobId: 'job-fail-429',
+            }),
+          },
+        ],
+      };
+
+      await expect(fetchWorker.handler(event)).rejects.toThrow('Rate limit exceeded');
+      expect(completeSyncJobSpy).toHaveBeenCalledWith('12345', 'job-fail-429', 'failed', 0);
     });
   });
 });

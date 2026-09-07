@@ -200,6 +200,9 @@ export class ApiStack extends cdk.Stack {
 
     props.kmsKey.grantEncryptDecrypt(this.fetchWorker);
     props.athletesTable.grantReadWriteData(this.fetchWorker);
+    props.activitiesTable.grantReadWriteData(this.fetchWorker);
+    props.rawBucket.grantReadWrite(this.fetchWorker);
+    props.eventBus.grantPutEventsTo(this.fetchWorker);
     this.activitySyncQueue.grantSendMessages(this.fetchWorker);
 
     this.fetchWorker.addEventSource(

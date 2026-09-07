@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const logger = require('./logger');
 const athleteRepository = require('./repositories/athlete-repository');
@@ -6,12 +7,35 @@ const stravaService = require('./services/strava');
 const queueService = require('./services/queue');
 const appRegistry = require('./services/app-registry');
 
+/**
+ * Retrieve and validate JWT secret.
+ * Fails closed if secret is missing or shorter than 32 characters (CWE-798).
+ */
 function getJwtSecret() {
-  return process.env.JWT_SECRET || 'dev-secret-key-at-least-32-chars-long';
+  const secret = process.env.JWT_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error('JWT_SECRET environment variable must be set and at least 32 characters long');
+  }
+  return secret;
+}
+
+/**
+ * Constant-time comparison to protect against timing attacks (CWE-208).
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function timingSafeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 /**
  * Verify JWT session from Authorization header.
+ * Pins algorithm to HS256 (CWE-327).
  * @returns {string} athleteId
  */
 function verifySession(headers) {
@@ -24,17 +48,23 @@ function verifySession(headers) {
 
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, getJwtSecret());
-    return String(decoded.athleteId);
+    const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ['HS256'] });
+    const athleteId = String(decoded.athleteId);
+    if (!athleteRepository.isValidAthleteId(athleteId)) {
+      const err = new Error('Invalid athlete ID format in session');
+      err.statusCode = 401;
+      throw err;
+    }
+    return athleteId;
   } catch (jwtErr) {
-    const err = new Error('Invalid or expired session token');
+    const err = new Error(jwtErr.statusCode === 401 ? jwtErr.message : 'Invalid or expired session token');
     err.statusCode = 401;
     throw err;
   }
 }
 
 /**
- * Build CORS and JSON response headers.
+ * Build hardened CORS and security response headers.
  */
 function buildResponse(statusCode, body = {}) {
   return {
@@ -44,6 +74,10 @@ function buildResponse(statusCode, body = {}) {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+      'Cache-Control': 'no-store, max-age=0',
     },
     body: typeof body === 'string' ? body : JSON.stringify(body),
   };
@@ -53,7 +87,7 @@ function buildResponse(statusCode, body = {}) {
  * Global error handler returning sanitized response.
  */
 function handleError(error, context = {}) {
-  const statusCode = error.statusCode || (error.message.includes('Unauthorized') ? 401 : 500);
+  const statusCode = error.statusCode || (error.message && error.message.includes('Unauthorized') ? 401 : 500);
 
   logger.error(
     { errMessage: error.message, statusCode, ...context },
@@ -91,17 +125,22 @@ async function handler(event) {
 
       const expectedToken = process.env.STRAVA_VERIFY_TOKEN;
 
-      if (mode === 'subscribe' && verifyToken && verifyToken === expectedToken) {
+      if (mode === 'subscribe' && verifyToken && expectedToken && timingSafeCompare(verifyToken, expectedToken)) {
         logger.info('Strava webhook subscription handshake verified');
         return {
           statusCode: 200,
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'Cache-Control': 'no-store, max-age=0',
+          },
           body: JSON.stringify({ 'hub.challenge': challenge }),
         };
       }
 
       logger.warn(
-        { mode, verifyTokenMatches: verifyToken === expectedToken },
+        { mode, hasVerifyToken: !!verifyToken },
         'Strava webhook verification failed'
       );
       return buildResponse(403, { error: 'Forbidden' });
@@ -109,6 +148,18 @@ async function handler(event) {
 
     // 2. POST /webhook - Event Ingestion from Strava
     if (routeKey === 'POST /webhook') {
+      // Timing-safe verification of webhook token if configured (CWE-306)
+      const expectedToken = process.env.STRAVA_VERIFY_TOKEN;
+      const params = new URLSearchParams(rawQuery);
+      const postToken = queryStringParameters.token || queryStringParameters['hub.verify_token'] || params.get('token');
+
+      if (expectedToken) {
+        if (!postToken || !timingSafeCompare(postToken, expectedToken)) {
+          logger.warn({ hasToken: !!postToken }, 'Unauthorized POST /webhook request');
+          return buildResponse(403, { error: 'Forbidden' });
+        }
+      }
+
       let payload;
       try {
         payload = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
@@ -125,16 +176,34 @@ async function handler(event) {
 
       // Handle athlete events (e.g. app deauthorization)
       if (object_type === 'athlete') {
+        const ownerIdStr = String(owner_id);
         if (updates?.authorized === 'false') {
-          logger.info({ owner_id }, 'Athlete deauthorized app from Strava');
-          await athleteRepository.deleteAthlete(owner_id);
+          if (!athleteRepository.isValidAthleteId(ownerIdStr)) {
+            logger.warn({ owner_id }, 'Invalid owner_id in athlete webhook event');
+            return buildResponse(400, { error: 'Invalid athlete ID' });
+          }
+          const existingAthlete = await athleteRepository.getAthlete(ownerIdStr);
+          if (existingAthlete) {
+            logger.info({ owner_id: ownerIdStr }, 'Athlete deauthorized app from Strava');
+            await athleteRepository.deleteAthlete(ownerIdStr);
+          } else {
+            logger.warn({ owner_id: ownerIdStr }, 'Deauthorization event for non-existent athlete');
+          }
         }
         return buildResponse(200, { status: 'OK' });
       }
 
       // Handle activity events (create, update, delete)
       if (object_type === 'activity') {
-        await queueService.enqueueActivitySync(owner_id, object_id, aspect_type, updates);
+        const ownerIdStr = String(owner_id);
+        const objectIdStr = String(object_id);
+
+        if (!athleteRepository.isValidAthleteId(ownerIdStr) || !activityRepository.isValidId(objectIdStr)) {
+          logger.warn({ owner_id, object_id }, 'Invalid owner_id or object_id format in webhook event');
+          return buildResponse(400, { error: 'Invalid identifier format' });
+        }
+
+        await queueService.enqueueActivitySync(ownerIdStr, objectIdStr, aspect_type, updates);
         return buildResponse(200, { status: 'OK' });
       }
 
@@ -160,6 +229,9 @@ async function handler(event) {
       }
 
       const athleteIdStr = String(athleteData.id);
+      if (!athleteRepository.isValidAthleteId(athleteIdStr)) {
+        return buildResponse(502, { error: 'Invalid athlete ID returned by Strava' });
+      }
 
       // Save athlete profile and encrypted tokens
       const savedAthlete = await athleteRepository.saveAthlete({
@@ -176,9 +248,13 @@ async function handler(event) {
         measurementPreference: athleteData.measurement_preference,
       });
 
-      // Trigger automatic 60-day historical backfill
+      // Trigger automatic 60-day historical backfill with concurrency lock
+      const initialJobId = crypto.randomUUID();
       try {
-        await queueService.enqueueActivityFetch(athleteIdStr, 60);
+        const lockAcquired = await athleteRepository.acquireSyncLock(athleteIdStr, initialJobId, 60);
+        if (lockAcquired) {
+          await queueService.enqueueActivityFetch(athleteIdStr, 60, initialJobId);
+        }
       } catch (queueErr) {
         logger.warn(
           { athleteId: athleteIdStr, errMessage: queueErr.message },
@@ -186,7 +262,7 @@ async function handler(event) {
         );
       }
 
-      // Generate signed JWT session token (14-day expiry)
+      // Generate signed JWT session token (14-day expiry, pinned HS256)
       const sessionToken = jwt.sign(
         {
           athleteId: athleteIdStr,
@@ -194,7 +270,7 @@ async function handler(event) {
           lastname: athleteData.lastname,
         },
         getJwtSecret(),
-        { expiresIn: '14d' }
+        { algorithm: 'HS256', expiresIn: '14d' }
       );
 
       return buildResponse(200, {
@@ -231,6 +307,8 @@ async function handler(event) {
         lastSyncAt: athlete.lastSyncAt,
         totalActivities: athlete.totalActivities || recentActivities.count,
         connected: true,
+        tier: athlete.tier || 'free',
+        syncJob: athlete.syncJob || null,
       });
     }
 
@@ -238,13 +316,34 @@ async function handler(event) {
     if (routeKey === 'POST /user/sync') {
       const athleteId = verifySession(headers);
       const body = typeof event.body === 'string' ? JSON.parse(event.body || '{}') : event.body;
-      const days = Number(body?.days) || 60;
+      const days = Number(body?.days ?? 60);
 
-      await queueService.enqueueActivityFetch(athleteId, days);
+      if (Number.isNaN(days) || days < 1) {
+        return buildResponse(400, { error: 'Invalid days parameter: must be a positive number' });
+      }
 
-      return buildResponse(200, {
+      if (days > 365) {
+        return buildResponse(400, {
+          error: 'For archives greater than 1 year, please use the Strava Bulk ZIP Import to avoid API rate limits.',
+        });
+      }
+
+      const jobId = crypto.randomUUID();
+      const lockAcquired = await athleteRepository.acquireSyncLock(athleteId, jobId, days);
+
+      if (!lockAcquired) {
+        return buildResponse(409, {
+          error: 'Sync already in progress. Please wait for the current sync to complete.',
+        });
+      }
+
+      await queueService.enqueueActivityFetch(athleteId, days, jobId);
+
+      return buildResponse(202, {
         success: true,
-        message: `Queued sync for the last ${days} days`,
+        jobId,
+        days,
+        message: `Backfill job enqueued for the last ${days} days`,
       });
     }
 
@@ -254,7 +353,11 @@ async function handler(event) {
       const athlete = await athleteRepository.getAthlete(athleteId, { decryptTokens: true });
 
       if (athlete && athlete.accessToken) {
-        await stravaService.deauthorize(athlete.accessToken);
+        try {
+          await stravaService.deauthorize(athlete.accessToken);
+        } catch (deauthErr) {
+          logger.warn({ athleteId, errMessage: deauthErr.message }, 'Failed to deauthorize token with Strava during account deletion');
+        }
       }
 
       await athleteRepository.deleteAthlete(athleteId);
@@ -284,4 +387,5 @@ module.exports = {
   verifySession,
   buildResponse,
   getJwtSecret,
+  timingSafeCompare,
 };

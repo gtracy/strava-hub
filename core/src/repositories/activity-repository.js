@@ -19,6 +19,10 @@ const ddbClient = new DynamoDBClient({ region });
 const docClient = DynamoDBDocumentClient.from(ddbClient);
 const s3Client = new S3Client({ region });
 
+function isValidId(id) {
+  return typeof id === 'string' && /^\d+$/.test(id);
+}
+
 function getTableName() {
   return process.env.ACTIVITIES_TABLE_NAME || `strava-hub-${process.env.STAGE || 'dev'}-activities`;
 }
@@ -31,6 +35,9 @@ function getBucketName() {
  * Format S3 key for storing raw activity JSON.
  */
 function getS3Key(athleteId, activityId) {
+  if (!isValidId(athleteId) || !isValidId(activityId)) {
+    throw new Error('Invalid athlete ID or activity ID for S3 key construction');
+  }
   return `athletes/${athleteId}/activities/${activityId}.json`;
 }
 
@@ -41,8 +48,13 @@ function getS3Key(athleteId, activityId) {
  * @returns {Promise<Object>} The saved activity metadata item
  */
 async function saveActivity(athleteId, rawActivity) {
-  const athleteIdStr = String(athleteId);
-  const activityIdStr = String(rawActivity.id);
+  const athleteIdStr = String(athleteId || '');
+  const activityIdStr = String(rawActivity?.id || '');
+
+  if (!isValidId(athleteIdStr) || !isValidId(activityIdStr)) {
+    throw new Error('Invalid athleteId or activityId format');
+  }
+
   const tableName = getTableName();
   const bucketName = getBucketName();
   const s3Key = getS3Key(athleteIdStr, activityIdStr);
@@ -89,6 +101,7 @@ async function saveActivity(athleteId, rawActivity) {
     hasHeartrate: !!rawActivity.has_heartrate,
     averageHeartrate: rawActivity.average_heartrate || null,
     maxHeartrate: rawActivity.max_heartrate || null,
+    resourceState: rawActivity.resource_state || 3,
     // Store summary polyline directly in DynamoDB for instant route rendering
     summaryPolyline: rawActivity.map?.summary_polyline || null,
     s3Key,
@@ -115,6 +128,91 @@ async function saveActivity(athleteId, rawActivity) {
     );
     throw ddbError;
   }
+}
+
+/**
+ * Save a summary activity from historical backfill.
+ * Condition: Does NOT overwrite existing detailed activities (resourceState: 3).
+ * @param {string} athleteId
+ * @param {Object} summaryActivity - Strava summary activity JSON
+ */
+async function saveSummaryActivity(athleteId, summaryActivity) {
+  const athleteIdStr = String(athleteId || '');
+  const activityIdStr = String(summaryActivity?.id || '');
+
+  if (!isValidId(athleteIdStr) || !isValidId(activityIdStr)) {
+    throw new Error('Invalid athleteId or activityId format');
+  }
+
+  const tableName = getTableName();
+  const bucketName = getBucketName();
+  const s3Key = getS3Key(athleteIdStr, activityIdStr);
+  const now = new Date().toISOString();
+
+  // Extract metadata
+  const metadataItem = {
+    athleteId: athleteIdStr,
+    activityId: activityIdStr,
+    name: summaryActivity.name || 'Untitled Activity',
+    type: summaryActivity.type || 'Workout',
+    sportType: summaryActivity.sport_type || summaryActivity.type || 'Workout',
+    startDate: summaryActivity.start_date || now,
+    startDateLocal: summaryActivity.start_date_local || null,
+    distance: typeof summaryActivity.distance === 'number' ? summaryActivity.distance : 0,
+    movingTime: typeof summaryActivity.moving_time === 'number' ? summaryActivity.moving_time : 0,
+    elapsedTime: typeof summaryActivity.elapsed_time === 'number' ? summaryActivity.elapsed_time : 0,
+    totalElevationGain: typeof summaryActivity.total_elevation_gain === 'number' ? summaryActivity.total_elevation_gain : 0,
+    averageSpeed: typeof summaryActivity.average_speed === 'number' ? summaryActivity.average_speed : 0,
+    maxSpeed: typeof summaryActivity.max_speed === 'number' ? summaryActivity.max_speed : 0,
+    hasHeartrate: !!summaryActivity.has_heartrate,
+    averageHeartrate: summaryActivity.average_heartrate || null,
+    maxHeartrate: summaryActivity.max_heartrate || null,
+    resourceState: summaryActivity.resource_state || 2,
+    summaryPolyline: summaryActivity.map?.summary_polyline || null,
+    s3Key,
+    updatedAt: now,
+  };
+
+  // 1. Write to DynamoDB conditionally (do not downgrade existing detailed record)
+  try {
+    const putDdbCommand = new PutCommand({
+      TableName: tableName,
+      Item: metadataItem,
+      ConditionExpression: 'attribute_not_exists(activityId) OR resourceState <= :maxResourceState',
+      ExpressionAttributeValues: {
+        ':maxResourceState': 2,
+      },
+    });
+    await docClient.send(putDdbCommand);
+    logger.debug({ athleteId: athleteIdStr, activityId: activityIdStr }, 'Saved summary activity to DynamoDB');
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      logger.debug(
+        { athleteId: athleteIdStr, activityId: activityIdStr },
+        'Detailed activity already exists; preserved without downgrade'
+      );
+      return metadataItem;
+    }
+    logger.error({ athleteId: athleteIdStr, activityId: activityIdStr, errMessage: err.message }, 'Failed to save summary activity');
+    throw err;
+  }
+
+  // 2. Upload summary JSON to S3
+  if (bucketName) {
+    try {
+      const putS3Command = new PutObjectCommand({
+        Bucket: bucketName,
+        Key: s3Key,
+        Body: JSON.stringify(summaryActivity),
+        ContentType: 'application/json',
+      });
+      await s3Client.send(putS3Command);
+    } catch (s3Err) {
+      logger.warn({ athleteId: athleteIdStr, activityId: activityIdStr, errMessage: s3Err.message }, 'Failed to upload summary JSON to S3');
+    }
+  }
+
+  return metadataItem;
 }
 
 /**
@@ -259,10 +357,12 @@ async function deleteActivity(athleteId, activityId) {
 
 module.exports = {
   saveActivity,
+  saveSummaryActivity,
   getActivity,
   listActivities,
   deleteActivity,
   getS3Key,
+  isValidId,
   docClient,
   s3Client,
 };

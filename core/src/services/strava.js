@@ -160,9 +160,9 @@ async function getActivity(accessToken, activityId, includeAllEfforts = true) {
  * @param {number} afterEpoch - Unix epoch seconds
  * @param {number} beforeEpoch - Unix epoch seconds
  * @param {number} [page=1]
- * @param {number} [perPage=30]
+ * @param {number} [perPage=200]
  */
-async function listActivities(accessToken, afterEpoch, beforeEpoch, page = 1, perPage = 30) {
+async function listActivities(accessToken, afterEpoch, beforeEpoch, page = 1, perPage = 200) {
   if (!accessToken) {
     throw new Error('Missing access token');
   }

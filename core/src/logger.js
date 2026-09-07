@@ -8,6 +8,21 @@ const logger = pino({
     service: 'strava-hub',
     env: process.env.STAGE || process.env.NODE_ENV || 'dev',
   },
+  redact: {
+    paths: [
+      'accessToken',
+      'refreshToken',
+      '*.accessToken',
+      '*.refreshToken',
+      'token',
+      'clientSecret',
+      'client_secret',
+      'authorization',
+      'headers.authorization',
+      'headers.Authorization',
+    ],
+    censor: '[REDACTED]',
+  },
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 
