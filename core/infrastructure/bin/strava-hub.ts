@@ -3,6 +3,7 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { CoreDataStack } from '../lib/core-data-stack';
 import { ApiStack } from '../lib/api-stack';
+import { WebStack } from '../lib/web-stack';
 
 const app = new cdk.App();
 
@@ -33,6 +34,14 @@ if (!targetEnv || targetEnv === 'dev') {
   });
 
   apiDev.addStackDependency(dataDev);
+
+  const webDev = new WebStack(app, 'StravaHubWeb-dev', {
+    environment: 'dev',
+    env: envConfig,
+    description: 'Strava Hub Web Dashboard Stack (Development Environment)',
+  });
+
+  webDev.addStackDependency(apiDev);
 }
 
 if (!targetEnv || targetEnv === 'prod') {
@@ -54,6 +63,14 @@ if (!targetEnv || targetEnv === 'prod') {
   });
 
   apiProd.addStackDependency(dataProd);
+
+  const webProd = new WebStack(app, 'StravaHubWeb-prod', {
+    environment: 'prod',
+    env: envConfig,
+    description: 'Strava Hub Web Dashboard Stack (Production Environment)',
+  });
+
+  webProd.addStackDependency(apiProd);
 }
 
 app.synth();

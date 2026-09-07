@@ -6,11 +6,13 @@
   "scripts": {
     "test": "jest --runInBand",
     "test:coverage": "jest --coverage --runInBand",
-    "cdk:synth:dev": "cd core/infrastructure && npx cdk synth StravaHubData-dev StravaHubApi-dev",
-    "cdk:synth:prod": "cd core/infrastructure && npx cdk synth StravaHubData-prod StravaHubApi-prod",
+    "frontend:build": "cd core/frontend && npm run build",
+    "frontend:dev": "cd core/frontend && npm run dev",
+    "cdk:synth:dev": "cd core/infrastructure && npx cdk synth StravaHubData-dev StravaHubApi-dev StravaHubWeb-dev",
+    "cdk:synth:prod": "cd core/infrastructure && npx cdk synth StravaHubData-prod StravaHubApi-prod StravaHubWeb-prod",
     "cdk:diff:dev": "cd core/infrastructure && npx cdk diff StravaHub*-dev",
-    "cdk:deploy:dev": "cd core/infrastructure && npx cdk deploy StravaHubData-dev StravaHubApi-dev",
-    "cdk:deploy:prod": "cd core/infrastructure && npx cdk deploy StravaHubData-prod StravaHubApi-prod"
+    "cdk:deploy:dev": "cd core/infrastructure && npx cdk deploy StravaHubData-dev StravaHubApi-dev StravaHubWeb-dev",
+    "cdk:deploy:prod": "cd core/infrastructure && npx cdk deploy StravaHubData-prod StravaHubApi-prod StravaHubWeb-prod"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.980.0",
